@@ -147,6 +147,73 @@ except ImportError:
         raise InvalidSchema("Missing dependencies for SOCKS support.")
 
 
+_TLSVerifyIdentity = tuple[str, str | bool]
+
+
+def _tls_verify_identity(verify: TLSVerifyType | None) -> _TLSVerifyIdentity:
+    """Return the effective verification policy before configuring a pool."""
+    if not verify:
+        return "disabled", False
+    if verify is True:
+        return "default", True
+    if isinstance(verify, bytes):
+        return "ca_data", verify.decode("utf-8")
+    if isinstance(verify, str):
+        if "-----BEGIN CERTIFICATE-----" in verify:
+            return "ca_data", verify
+        if (verify.startswith("sha256_") and len(verify) == 71) or (verify.startswith("sha1_") and len(verify) == 45):
+            return "fingerprint", verify.split("_", 1)[-1]
+        return "ca_path", verify
+    return "ca_path", os.fspath(verify)
+
+
+def _configure_tls_verify(
+    conn: HTTPSConnectionPool | AsyncHTTPSConnectionPool,
+    verify: TLSVerifyType | None,
+) -> bool:
+    """Apply one normalized verification policy and report whether connections must restart."""
+    identity = _tls_verify_identity(verify)
+    missing = object()
+    previous = getattr(conn, "_niquests_verify_identity", missing)
+    if previous == identity:
+        return False
+
+    kind, value = identity
+    cert_reqs = "CERT_NONE" if kind in {"disabled", "fingerprint"} else "CERT_REQUIRED"
+    ca_certs: str | None = None
+    ca_cert_dir: str | None = None
+    ca_cert_data: str | None = None
+    assert_fingerprint: str | None = None
+
+    if kind == "default":
+        assert wassima is not None
+        ca_cert_data = wassima.generate_ca_bundle()
+    elif kind == "ca_data":
+        assert isinstance(value, str)
+        ca_cert_data = value
+    elif kind == "ca_path":
+        assert isinstance(value, str)
+        if not os.path.exists(value):
+            raise OSError(f"Could not find a suitable TLS CA certificate bundle, invalid path: {value}")
+        if os.path.isdir(value):
+            ca_cert_dir = value
+        else:
+            ca_certs = value
+    elif kind == "fingerprint":
+        assert isinstance(value, str)
+        assert_fingerprint = value
+
+    need_reboot_conn = previous is not missing or conn.cert_reqs != cert_reqs
+    conn.cert_reqs = cert_reqs
+    conn.ca_certs = ca_certs
+    conn.ca_cert_dir = ca_cert_dir
+    conn.ca_cert_data = ca_cert_data
+    conn.assert_fingerprint = assert_fingerprint
+    setattr(conn, "_niquests_verify_identity", identity)
+    setattr(conn, "_niquests_verify", verify)
+    return need_reboot_conn
+
+
 _TLS_SCHEMES = frozenset(("https", "sse", "wss"))
 
 
@@ -555,71 +622,7 @@ class HTTPAdapter(BaseAdapter):
         if scheme not in _TLS_SCHEMES:
             return
 
-        need_reboot_conn: bool = False
-        verify_witness_bit: bool = getattr(conn, "_niquests_verify", object()) == verify
-
-        if not verify_witness_bit:
-            if verify:
-                cert_loc: str | None = None
-                cert_data: str | None = wassima.generate_ca_bundle()
-                assert_fingerprint: str | None = None
-
-                if isinstance(verify, str):
-                    if "-----BEGIN CERTIFICATE-----" in verify:
-                        cert_data = verify
-                        verify = True
-                    elif verify.startswith("sha256_") or verify.startswith("sha1_"):
-                        if len(verify) in [71, 45]:
-                            assert_fingerprint = verify.split("_", 1)[-1]
-                            verify = False
-                            cert_data = None
-
-                if isinstance(verify, bytes):
-                    cert_data = verify.decode("utf-8")
-                else:
-                    # Allow self-specified cert location.
-                    # Plain str path
-                    if isinstance(verify, str):
-                        cert_loc = verify
-                    # or path-like obj, that should have __fspath__
-                    elif hasattr(verify, "__fspath__"):
-                        cert_loc = verify.__fspath__()
-
-                    if isinstance(cert_loc, str) and not os.path.exists(cert_loc):
-                        raise OSError(f"Could not find a suitable TLS CA certificate bundle, invalid path: {cert_loc}")
-
-                if not assert_fingerprint:
-                    if conn.cert_reqs != "CERT_REQUIRED":
-                        need_reboot_conn = True
-
-                    conn.cert_reqs = "CERT_REQUIRED"
-                else:
-                    if conn.cert_reqs != "CERT_NONE":
-                        need_reboot_conn = True
-
-                    conn.cert_reqs = "CERT_NONE"
-
-                if cert_data and cert_loc is None:
-                    conn.ca_certs = None
-                    conn.ca_cert_dir = None
-                    conn.ca_cert_data = cert_data
-                elif cert_loc:
-                    if not os.path.isdir(cert_loc):
-                        conn.ca_certs = cert_loc
-                    else:
-                        conn.ca_cert_dir = cert_loc
-                else:
-                    conn.assert_fingerprint = assert_fingerprint
-            else:
-                if conn.cert_reqs != "CERT_NONE":
-                    need_reboot_conn = True
-
-                conn.cert_reqs = "CERT_NONE"
-                conn.ca_certs = None
-                conn.ca_cert_dir = None
-                conn.ca_cert_data = None
-
-            setattr(conn, "_niquests_verify", verify)
+        need_reboot_conn = _configure_tls_verify(conn, verify)
         if cert:
             if not isinstance(cert, str):
                 if "-----BEGIN CERTIFICATE-----" in cert[0]:
@@ -1656,70 +1659,7 @@ class AsyncHTTPAdapter(AsyncBaseAdapter):
         if scheme not in _TLS_SCHEMES:
             return False
 
-        need_reboot_conn: bool = False
-        verify_witness_bit: bool = getattr(conn, "_niquests_verify", object()) == verify
-
-        if not verify_witness_bit:
-            if verify:
-                cert_loc: str | None = None
-                cert_data: str | None = wassima.generate_ca_bundle()
-                assert_fingerprint: str | None = None
-
-                if isinstance(verify, str):
-                    if "-----BEGIN CERTIFICATE-----" in verify:
-                        cert_data = verify
-                        verify = True
-                    elif verify.startswith("sha256_") or verify.startswith("sha1_"):
-                        if len(verify) in [71, 45]:
-                            assert_fingerprint = verify.split("_", 1)[-1]
-                            verify = False
-                            cert_data = None
-
-                if isinstance(verify, bytes):
-                    cert_data = verify.decode("utf-8")
-                else:
-                    # Allow self-specified cert location.
-                    if isinstance(verify, str):
-                        cert_loc = verify
-
-                    elif hasattr(verify, "__fspath__"):
-                        cert_loc = verify.__fspath__()
-
-                    if isinstance(cert_loc, str) and not os.path.exists(cert_loc):
-                        raise OSError(f"Could not find a suitable TLS CA certificate bundle, invalid path: {cert_loc}")
-
-                if not assert_fingerprint:
-                    if conn.cert_reqs != "CERT_REQUIRED":
-                        need_reboot_conn = True
-
-                    conn.cert_reqs = "CERT_REQUIRED"
-                else:
-                    if conn.cert_reqs != "CERT_NONE":
-                        need_reboot_conn = True
-
-                    conn.cert_reqs = "CERT_NONE"
-
-                if cert_data and cert_loc is None:
-                    conn.ca_certs = None
-                    conn.ca_cert_dir = None
-                    conn.ca_cert_data = cert_data
-                elif cert_loc:
-                    if not os.path.isdir(cert_loc):
-                        conn.ca_certs = cert_loc
-                    else:
-                        conn.ca_cert_dir = cert_loc
-                else:
-                    conn.assert_fingerprint = assert_fingerprint
-            else:
-                if conn.cert_reqs != "CERT_NONE":
-                    need_reboot_conn = True
-
-                conn.cert_reqs = "CERT_NONE"
-                conn.ca_certs = None
-                conn.ca_cert_dir = None
-                conn.ca_cert_data = None
-
-            setattr(conn, "_niquests_verify", verify)
+        need_reboot_conn = _configure_tls_verify(conn, verify)
 
         if cert:
             if not isinstance(cert, str):

@@ -73,6 +73,25 @@ class _StopSend(Exception):
     """Sentinel raised from a patched ``Session.send`` to capture the prepared URL without I/O."""
 
 
+def assert_verify_state(
+    connection,
+    identity,
+    *,
+    cert_reqs,
+    ca_certs=None,
+    ca_cert_dir=None,
+    ca_cert_data=None,
+    assert_fingerprint=None,
+):
+    """Check the complete mutually exclusive verification state on a real pool."""
+    assert connection._niquests_verify_identity == identity
+    assert connection.cert_reqs == cert_reqs
+    assert connection.ca_certs == ca_certs
+    assert connection.ca_cert_dir == ca_cert_dir
+    assert connection.ca_cert_data == ca_cert_data
+    assert connection.assert_fingerprint == assert_fingerprint
+
+
 class TestRequests:
     digest_auth_algo = ("MD5", "SHA-256", "SHA-512")
 
@@ -1092,6 +1111,127 @@ class TestRequests:
         assert r.status_code == 204
 
         await s.close()
+
+    def test_cert_verify_replaces_complete_policy_state(self, tmp_path):
+        adapter = HTTPAdapter()
+        connection = adapter.poolmanager.connection_from_url("https://example.test/")
+        inline = "-----BEGIN CERTIFICATE-----\ninline\n-----END CERTIFICATE-----\n"
+        fingerprint = "sha256_" + "1" * 64
+        ca_file = tmp_path / "ca.pem"
+        ca_file.write_text("certificate")
+        ca_dir = tmp_path / "certificates"
+        ca_dir.mkdir()
+
+        try:
+            with mock.patch(
+                "niquests.adapters.wassima.generate_ca_bundle",
+                return_value="DEFAULT",
+            ) as generate:
+                adapter.cert_verify(connection, "https://example.test/", inline, None)
+                assert_verify_state(
+                    connection,
+                    ("ca_data", inline),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_data=inline,
+                )
+                adapter.cert_verify(connection, "https://example.test/", inline, None)
+                assert generate.call_count == 0
+
+                adapter.cert_verify(connection, "https://example.test/", True, None)
+                assert_verify_state(
+                    connection,
+                    ("default", True),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_data="DEFAULT",
+                )
+                adapter.cert_verify(connection, "https://example.test/", True, None)
+                assert generate.call_count == 1
+
+                adapter.cert_verify(connection, "https://example.test/", fingerprint, None)
+                assert_verify_state(
+                    connection,
+                    ("fingerprint", "1" * 64),
+                    cert_reqs="CERT_NONE",
+                    assert_fingerprint="1" * 64,
+                )
+                adapter.cert_verify(connection, "https://example.test/", False, None)
+                assert_verify_state(
+                    connection,
+                    ("disabled", False),
+                    cert_reqs="CERT_NONE",
+                )
+
+                adapter.cert_verify(connection, "https://example.test/", str(ca_file), None)
+                assert_verify_state(
+                    connection,
+                    ("ca_path", str(ca_file)),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_certs=str(ca_file),
+                )
+                adapter.cert_verify(connection, "https://example.test/", ca_dir, None)
+                assert_verify_state(
+                    connection,
+                    ("ca_path", str(ca_dir)),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_dir=str(ca_dir),
+                )
+                adapter.cert_verify(connection, "https://example.test/", inline.encode(), None)
+                assert_verify_state(
+                    connection,
+                    ("ca_data", inline),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_data=inline,
+                )
+        finally:
+            adapter.close()
+
+    @pytest.mark.asyncio
+    async def test_async_cert_verify_replaces_complete_policy_state(self, tmp_path):
+        adapter = AsyncHTTPAdapter()
+        connection = await adapter.poolmanager.connection_from_url("https://example.test/")
+        inline = "-----BEGIN CERTIFICATE-----\ninline\n-----END CERTIFICATE-----\n"
+        fingerprint = "sha256_" + "1" * 64
+
+        try:
+            with mock.patch(
+                "niquests.adapters.wassima.generate_ca_bundle",
+                return_value="DEFAULT",
+            ) as generate:
+                adapter.cert_verify(connection, "https://example.test/", inline, None)
+                assert_verify_state(
+                    connection,
+                    ("ca_data", inline),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_data=inline,
+                )
+                assert not adapter.cert_verify(connection, "https://example.test/", inline, None)
+                assert generate.call_count == 0
+
+                assert adapter.cert_verify(connection, "https://example.test/", True, None)
+                assert_verify_state(
+                    connection,
+                    ("default", True),
+                    cert_reqs="CERT_REQUIRED",
+                    ca_cert_data="DEFAULT",
+                )
+                assert not adapter.cert_verify(connection, "https://example.test/", True, None)
+                assert generate.call_count == 1
+
+                assert adapter.cert_verify(connection, "https://example.test/", fingerprint, None)
+                assert_verify_state(
+                    connection,
+                    ("fingerprint", "1" * 64),
+                    cert_reqs="CERT_NONE",
+                    assert_fingerprint="1" * 64,
+                )
+                assert adapter.cert_verify(connection, "https://example.test/", False, None)
+                assert_verify_state(
+                    connection,
+                    ("disabled", False),
+                    cert_reqs="CERT_NONE",
+                )
+        finally:
+            await adapter.close()
 
     @pytest.mark.parametrize(
         "env, expected",
