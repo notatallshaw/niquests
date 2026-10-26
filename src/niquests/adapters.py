@@ -147,7 +147,7 @@ except ImportError:
         raise InvalidSchema("Missing dependencies for SOCKS support.")
 
 
-_TLSVerifyIdentity = tuple[str, str | bool]
+_TLSVerifyIdentity = typing.Tuple[str, typing.Union[str, bool]]
 
 
 def _tls_verify_identity(verify: TLSVerifyType | None) -> _TLSVerifyIdentity:
